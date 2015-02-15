@@ -1,0 +1,160 @@
+#!/bin/bash
+
+# vim: set ts=4 sw=4 et
+
+# default values
+IP_ADDRESS=""
+OS_TEMPLATE="ubuntu-14.04-x86_64-minimal"
+VM_HOSTNAME=""
+VM_RAM="512M"
+VM_SWAP="1G"
+VM_DISK_QUOTA="20G"
+DRY_RUN=false
+
+function next_vm() {
+    echo $(( 1 + `ls  /etc/vz/conf/???.conf | sed -e 's/\.conf//' | awk -F '/' '{ print $5 }' | sort -nr | head -1`))
+}
+
+function from_human() {
+echo "$1" | awk '{
+    h_r_number = $1; mag = index("KMG", substr(h_r_number, length(h_r_number)))
+    if(mag == 0) { sum = h_r_number }
+    else { sum += substr(h_r_number, 0, length(h_r_number) - 1) * 10^(mag *3) }
+}
+END {print sum}'
+}
+
+# Awful!
+function inodes_from_size() {
+    echo $(( $1 / 10000 ))
+}
+
+function syntax() {
+    echo "Syntax:"
+    echo "  vzcfr <action>"
+    echo
+    echo "  vzcfr next"
+    echo "    -> display id of next vm that will be created"
+    echo
+    echo "  vzcfr create <-i ip> [-o os_template] [-r ram] [-s ram_swap] [-q disk_quota] [-h hostname] [-d]"
+    echo "    -> create a new vm"
+    echo "       ip is last byte of ip address only"
+    echo "       default os template is ubuntu minimal"
+    echo "       default ram is 512M"
+    echo "       default ram swap is 1G"
+    echo "       default disk quota is 20G"
+    echo "       use '-d' to perform a dry run"
+    echo
+}
+
+function nextvm() {
+    local vm=`next_vm`
+    echo "$vm"
+}
+
+function createvm() {
+    if [ $# -lt 2 ]; then
+        syntax && exit 3
+    fi
+    if [ "$IP_ADDRESS" == "" ]; then
+        syntax && exit 4
+    fi
+    local cid=`next_vm`
+    local cip="10.0.0.${IP_ADDRESS}"
+    echo "Creating vm id: ${cid} ip: ${cip}"
+
+    if [ $DRY_RUN == true ]; then
+        echo "os template: ${OS_TEMPLATE}"
+        echo "vm ram: ${VM_RAM}"
+        echo "vm ram swap: ${VM_SWAP}"
+        echo "vm disk quota: ${VM_DISK_QUOTA}"
+        echo "vm disk inodes: ${VM_INODES}"
+        if [ "$VM_HOSTNAME" != "" ]; then
+            echo "vm hostname: ${VM_HOSTNAME}"
+        else
+            echo "vm hostname: none specified"
+        fi
+        return
+    fi
+
+    true && \
+    vzctl create ${cid} --ostemplate ${OS_TEMPLATE} && \
+    vzctl set ${cid} --numothersock 120 --save && \
+    vzctl set ${cid} --nameserver 8.8.8.8 --nameserver 8.8.4.4 --save && \
+    vzctl set ${cid} --ipadd ${cip} --save && \
+    vzctl set ${cid} --ram ${VM_RAM} --swap ${VM_SWAP} --save && \
+    vzctl set ${cid} --diskspace ${VM_DISK_QUOTA}:${VM_DISK_QUOTA} --save && \
+    vzctl set ${cid} --diskinodes ${VM_INODES}:${VM_INODES} --save
+
+    if [ $? -ne 0 ]; then
+        echo "Error: Aborting."
+        exit 5
+    fi
+
+    if [ "$VM_HOSTNAME" != "" ]; then
+        vzctl set ${cid} --hostname ${VM_HOSTNAME} --save
+    fi
+
+    if [ $? -ne 0 ]; then
+        echo "Error: Aborting."
+        exit 6
+    fi
+
+    echo "Done."
+}
+
+if [ $# -lt 1 ]; then
+    syntax && exit 1
+fi
+
+ACTION=$1
+shift
+
+while getopts ":i:o:h:r:s:q:d" opt; do
+    case $opt in
+    i)
+        IP_ADDRESS=$OPTARG
+        ;;
+    o)
+        OS_TEMPLATE=$OPTARG
+        ;;
+    r)
+        VM_RAM=$OPTARG
+        ;;
+    s)
+        VM_SWAP=$OPTARG
+        ;;
+    q)
+        VM_DISK_QUOTA=$OPTARG
+        ;;
+    h)
+        VM_HOSTNAME=$OPTARG
+        ;;
+    d)
+        DRY_RUN=true
+        ;;
+    \?)
+        echo "Invalid option: -$OPTARG"
+        syntax && exit 2
+        ;;
+    :)
+        echo "Please provide an argument for option: -$OPTARG"
+        syntax && exit 2
+        ;;
+    esac
+done
+
+quotasize=`from_human ${VM_DISK_QUOTA}`
+VM_INODES=`inodes_from_size ${quotasize}`
+
+case $ACTION in
+next)
+    nextvm
+    ;;
+create)
+    createvm "$@"
+    ;;
+*)
+    syntax
+    ;;
+esac
