@@ -9,7 +9,13 @@ VM_HOSTNAME=""
 VM_RAM="512M"
 VM_SWAP="1G"
 VM_DISK_QUOTA="20G"
+VM_NOUPDATE=false
 DRY_RUN=false
+HAPROXY_CFG=false
+
+function errcheck() {
+    if [ $? -ne 0 ]; then echo "Error: Aborting."; exit 5; fi
+}
 
 function next_vm() {
     echo $(( 1 + `ls  /etc/vz/conf/???.conf | sed -e 's/\.conf//' | awk -F '/' '{ print $5 }' | sort -nr | head -1`))
@@ -36,7 +42,7 @@ function syntax() {
     echo "  vzcfr next"
     echo "    -> display id of next vm that will be created"
     echo
-    echo "  vzcfr create <-i ip> [-o os_template] [-r ram] [-s ram_swap] [-q disk_quota] [-h hostname] [-d]"
+    echo "  vzcfr create <-i ip> [-o os_template] [-r ram] [-s ram_swap] [-q disk_quota] [-h hostname] [-d] [-p]"
     echo "    -> create a new vm"
     echo "       ip is last byte of ip address only"
     echo "       default os template is ubuntu minimal"
@@ -44,6 +50,14 @@ function syntax() {
     echo "       default ram swap is 1G"
     echo "       default disk quota is 20G"
     echo "       use '-d' to perform a dry run"
+    echo "       use '-p' to also configure a pre-configured haproxy instance"
+    echo
+    echo "  vzcfr go <id>"
+    echo "    -> start and enter vm"
+    echo
+    echo "  vzcfr install [-u] <id> <apache,nginx,php,phpgd,python,pythonimg,mysql,psql,sqlite,mongo,node,meteor,git>"
+    echo "    -> install environment"
+    echo "       if -u is present, no update will be performed beforehand"
     echo
 }
 
@@ -53,14 +67,20 @@ function nextvm() {
 }
 
 function createvm() {
-    if [ $# -lt 2 ]; then
+    if [ $# -lt 1 ]; then
         syntax && exit 3
     fi
-    if [ "$IP_ADDRESS" == "" ]; then
-        syntax && exit 4
-    fi
     local cid=`next_vm`
+    if [ "$IP_ADDRESS" == "" ]; then
+        IP_ADDRESS="${cid}"
+    fi
     local cip="10.0.0.${IP_ADDRESS}"
+    if [ $DRY_RUN == true ]; then
+        echo "-----------------------------------"
+        echo "| Do not panic! This is a dry run |"
+        echo "-----------------------------------"
+        echo
+    fi
     echo "Creating vm id: ${cid} ip: ${cip}"
 
     if [ $DRY_RUN == true ]; then
@@ -85,22 +105,176 @@ function createvm() {
     vzctl set ${cid} --ram ${VM_RAM} --swap ${VM_SWAP} --save && \
     vzctl set ${cid} --diskspace ${VM_DISK_QUOTA}:${VM_DISK_QUOTA} --save && \
     vzctl set ${cid} --diskinodes ${VM_INODES}:${VM_INODES} --save
-
-    if [ $? -ne 0 ]; then
-        echo "Error: Aborting."
-        exit 5
-    fi
+    errcheck
 
     if [ "$VM_HOSTNAME" != "" ]; then
         vzctl set ${cid} --hostname ${VM_HOSTNAME} --save
     fi
+    errcheck
 
-    if [ $? -ne 0 ]; then
-        echo "Error: Aborting."
-        exit 6
+    if [ $HAPROXY_CFG == true ]; then
+        echo "Configuring haproxy"
+        sed -i "s/# cfr-acl-end/acl host_${cid} hdr(host) -i ${VM_HOSTNAME}\n    # cfr-acl-end/" /etc/haproxy/haproxy.cfg
+        sed -i "s/# cfr-frontend-end/use_backend pub_${cid} if host_${cid}\n    # cfr-frontend-end/" /etc/haproxy/haproxy.cfg
+        sed -i "s/# cfr-backend-end/backend pub_${cid}\n    balance leastconn\n    option httpclose\n    server pub_back_${cid} ${cip}:80 cookie pub_back_${cid} check\n\n# cfr-backend-end/" /etc/haproxy/haproxy.cfg
+        service haproxy restart
     fi
 
     echo "Done."
+}
+
+function govm() {
+    if [ $# -lt 1 ]; then
+        syntax && exit 3
+    fi
+    local cid="$1"
+    vzctl start $cid
+    vzctl enter $cid
+}
+
+function installvm() {
+    if [ $VM_NOUPDATE == true ]; then
+        shift
+    fi
+    if [ $# -lt 1 ]; then
+        syntax && exit 3
+    fi
+    local cid="$1"
+    local install_apache=false
+    local install_nginx=false
+    local install_php=false
+    local install_phpgd=false
+    local install_python=false
+    local install_pythonimg=false
+    local install_mysql=false
+    local install_psql=false
+    local install_sqlite=false
+    local install_mongo=false
+    local install_meteor=false
+    local install_node=false
+    local install_git=false
+    IFS=',' read -a actions <<< "$2"
+    for action in "${actions[@]}"
+    do
+        case $action in
+        apache)
+            install_apache=true
+            ;;
+        nginx)
+            install_nginx=true
+            ;;
+        php)
+            install_php=true
+            ;;
+        phpgd)
+            install_php=true
+            install_phpgd=true
+            ;;
+        python)
+            install_python=true
+            ;;
+        pythonimg)
+            install_python=true
+            install_pythonimg=true
+            ;;
+        mysql)
+            install_mysql=true
+            ;;
+        psql)
+            install_psql=true
+            ;;
+        sqlite)
+            install_sqlite=true
+            ;;
+        node)
+            install_node=true
+            ;;
+        git)
+            install_git=true
+            ;;
+        esac
+    done
+    if [ $VM_NOUPDATE == false ]; then
+        vzctl exec $cid apt-get update
+        errcheck
+    fi
+    if [ $install_apache == true ]; then
+        vzctl exec $cid apt-get install -y apache2
+        errcheck
+        vzctl exec $cid a2enmod rewrite
+        errcheck
+    fi
+    if [ $install_nginx == true ]; then
+        vzctl exec $cid apt-get install -y nginx
+        errcheck
+    fi
+    if [ $install_php == true ]; then
+        vzctl exec $cid apt-get install -y php5 php5-mcrypt php5-curl
+        errcheck
+        if [ $install_phpgd == true ]; then
+            vzctl exec $cid apt-get install -y php5-gd
+            errcheck
+        fi
+        if [ $install_apache == true ]; then
+            vzctl exec $cid apt-get install -y libapache2-mod-php5
+            errcheck
+            vzctl exec $cid "sed -ri 's/index.html/index.php index.html/' /etc/apache2/mods-enabled/dir.conf"
+            errcheck
+            vzctl exec $cid /etc/init.d/apache2 restart
+            errcheck
+        fi
+        if [ $install_nginx == true ]; then
+            vzctl exec $cid apt-get install -y php5-fpm
+            errcheck
+            vzctl exec $cid "sed -ri 's/cgi.fix_pathinfo=1/cgi.fix_pathinfo=0/' /etc/php5/fpm/php.ini"
+            errcheck
+        fi
+        if [ $install_mysql == true ]; then
+            vzctl exec $cid apt-get install -y php5-mysql
+        fi
+        if [ $install_psql == true ]; then
+            vzctl exec $cid apt-get install -y php5-pgsql
+        fi
+        if [ $install_sqlite == true ]; then
+            vzctl exec $cid apt-get install -y php5-sqlite
+        fi
+    fi
+    if [ $install_python == true ]; then
+        vzctl exec $cid apt-get install -y python-virtualenv
+        errcheck
+        if [ $install_pythonimg == true ]; then
+            vzctl exec $cid ". /etc/lsb-release && echo deb-src http://archive.ubuntu.com/ubuntu/ $DISTRIB_CODENAME main restricted universe multiverse >> /etc/apt/sources.list"
+            vzctl exec $cid apt-get update
+            errcheck
+            vzctl exec $cid apt-get build-dep -y python-imaging
+            errcheck
+        fi
+    fi
+    if [ $install_mysql == true ]; then
+        vzctl exec $cid apt-get --reinstall install -y bsdutils
+        errcheck
+        vzctl exec $cid apt-get install -y mysql-server
+        errcheck
+    fi
+    if [ $install_psql == true ]; then
+        vzctl exec $cid apt-get install -y postgresql postgresql-contrib
+        errcheck
+    fi
+    if [ $install_sqlite == true ]; then
+        vzctl exec $cid apt-get install -y sqlite3 libsqlite3-dev
+        errcheck
+    fi
+    if [ $install_node == true ]; then
+        vzctl exec $cid apt-get install -y node npm
+        errcheck
+        vzctl exec $cid rm -f /usr/sbin/node
+        vzctl exec $cid ln -s /usr/sbin/nodejs /usr/sbin/node
+    fi
+    if [ $install_git == true ]; then
+        vzctl exec $cid apt-get install -y git
+        errcheck
+    fi
+
 }
 
 if [ $# -lt 1 ]; then
@@ -110,7 +284,7 @@ fi
 ACTION=$1
 shift
 
-while getopts ":i:o:h:r:s:q:d" opt; do
+while getopts ":i:o:h:r:s:q:udp" opt; do
     case $opt in
     i)
         IP_ADDRESS=$OPTARG
@@ -130,8 +304,14 @@ while getopts ":i:o:h:r:s:q:d" opt; do
     h)
         VM_HOSTNAME=$OPTARG
         ;;
+    u)
+        VM_NOUPDATE=true
+        ;;
     d)
         DRY_RUN=true
+        ;;
+    p)
+        HAPROXY_CFG=true
         ;;
     \?)
         echo "Invalid option: -$OPTARG"
@@ -153,6 +333,12 @@ next)
     ;;
 create)
     createvm "$@"
+    ;;
+go)
+    govm "$@"
+    ;;
+install)
+    installvm "$@"
     ;;
 *)
     syntax
